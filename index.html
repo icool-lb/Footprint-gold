@@ -491,88 +491,6 @@ canvas{position:absolute;top:0;left:0;display:block}
 <script>
 "use strict";
 // ══════════════════════════════════════════════════════
-// CONFIG & STATE
-// ══════════════════════════════════════════════════════
-const CFG = {
-  token:   localStorage.getItem('mm_token')   || '',
-  account: localStorage.getItem('mm_account') || '',
-  symbol:  localStorage.getItem('mm_symbol')  || 'XAUUSD',
-  risk:    parseFloat(localStorage.getItem('mm_risk') || '1'),
-};
-
-const IND = {
-  ema20:true,ema50:true,ema200:true,vwap:true,
-  ob:true,fvg:true,sweep:true,disp:true,absorb:true,
-  bos:true,eqlh:true,prem:true,fib:true,
-  sig:true,kz:true,vol:true,delta:true
-};
-
-const S = {
-  candles:[],viewStart:0,viewEnd:0,cw:8,gap:2,
-  dragging:false,dragX:0,dragV:0,
-  mx:-1,my:-1,hoverIdx:-1,
-  W:0,H:0,zoomPct:100,
-  volH:55,deltaH:45,
-  // MetaAPI state
-  connected:false,connection:null,api:null,account:null,
-  accountInfo:{},openPositions:[],
-  price:3424.5,bid:3424.5,ask:3424.85,spread:0.35,
-  tf:'15m',
-};
-
-const CACHE = {
-  ema20:[],ema50:[],ema200:[],vwap:[],atr:[],
-  obs:[],fvgs:[],sweeps:[],disps:[],absorbs:[],
-  bos:[],eqlh:{h:[],l:[]},fib:{lo:0,hi:0},
-  signal:null,
-};
-
-// ══════════════════════════════════════════════════════
-// DATA GENERATION (for when MetaAPI not connected)
-// ══════════════════════════════════════════════════════
-function seededRand(seed){
-  let s=seed;
-  return ()=>{s=(s*9301+49297)%233280;return s/233280;};
-}
-
-function generateCandles(n=200,base=3400,seed=42){
-  const r=seededRand(seed), cs=[];
-  let p=base;
-  const phases=[0.5,-0.3,0.7,0.2,-0.4,0.6,-0.2,0.4];
-  for(let i=0;i<n;i++){
-    const phase=phases[Math.floor(i/25)%phases.length];
-    p+=phase*(0.4+r()*1.2)+(r()-0.5)*5;
-    p=Math.max(3280,Math.min(3560,p));
-    const body=(r()*7);
-    const bull=r()>0.44;
-    const o=bull?p-body/2:p+body/2;
-    const c=bull?p+body/2:p-body/2;
-    const h=Math.max(o,c)+(r()*3.5);
-    const l=Math.min(o,c)-(r()*3.5);
-    const v=Math.floor(1800+r()*9000);
-    let sp=null;
-    if(i===44)sp='sweep_low';
-    else if(i===45)sp='disp_up';
-    else if(i===118)sp='sweep_high';
-    else if(i===119)sp='disp_down';
-    cs.push({o:+o.toFixed(2),h:+h.toFixed(2),l:+l.toFixed(2),c:+c.toFixed(2),v,
-      t:Date.now()-((n-i)*15*60*1000),bull,sp,range:h-l});
-  }
-  // Inject special candles
-  const eql=Math.min(...cs.slice(37,44).map(c=>c.l));
-  Object.assign(cs[44],{l:eql-4.5,sp:'sweep_low',bull:true,c:cs[44].c+2.5});
-  cs[44].h=Math.max(cs[44].h,cs[44].c+1.5);
-  Object.assign(cs[45],{o:cs[44].c,c:cs[44].c+18,h:cs[44].c+20,l:cs[44].c-1,
-    v:14000,sp:'disp_up',bull:true,body:18,range:21});
-  const eqh=Math.max(...cs.slice(111,118).map(c=>c.h));
-  Object.assign(cs[118],{h:eqh+5,sp:'sweep_high',bull:false,c:cs[118].c-2});
-  cs[118].l=Math.min(cs[118].l,cs[118].c-1.5);
-  Object.assign(cs[119],{o:cs[118].c,c:cs[118].c-16,l:cs[118].c-18,h:cs[118].c+1,
-    v:13000,sp:'disp_down',bull:false,body:16,range:19});
-  return cs;
-}
-
-// ══════════════════════════════════════════════════════
 // INDICATORS
 // ══════════════════════════════════════════════════════
 function calcEMA(src,p){
@@ -1274,9 +1192,9 @@ document.querySelectorAll('.tf-btn').forEach(btn=>{
   btn.onclick=()=>{
     document.querySelectorAll('.tf-btn').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');S.tf=btn.dataset.tf;
-    const seeds={'1m':11,'5m':22,'15m':42,'1h':77,'4h':99,'1d':33};
-    S.candles=generateCandles(200,3400,seeds[S.tf]||42);
-    computeAll();fitAll();
+    if(S.connected){
+      fetchCandles().then(()=>{computeAll();fitAll();});
+    }
   };
 });
 
@@ -1494,52 +1412,17 @@ function showTradeResult(msg,col){
 }
 
 // ══════════════════════════════════════════════════════
-// LIVE SIMULATION (when no MetaAPI)
-// ══════════════════════════════════════════════════════
-function simulateTick(){
-  if(S.connected)return; // use real data
-  const cs=S.candles;if(!cs.length)return;
-  const last=cs[cs.length-1];
-  const delta=(Math.random()-.49)*1.4;
-  last.c=Math.max(3280,Math.min(3560,last.c+delta));
-  last.h=Math.max(last.h,last.c);last.l=Math.min(last.l,last.c);
-  last.bull=last.c>=last.o;last.v+=Math.floor(Math.random()*300);
-  updateTopStats();render();
-}
-
 // ══════════════════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════════════════
 window.addEventListener('resize',resize);
 
-S.candles=generateCandles(200,3400,42);
-computeAll();
-setTimeout(()=>{
-  resize();
-  const total=S.candles.length;
-  S.viewStart=Math.max(0,total-80);S.viewEnd=total;
-  S.cw=10;
-  document.getElementById('z-label').textContent='150%';
-  render();
-},60);
-
-setInterval(simulateTick,800);
-
 // Auto-connect if credentials saved
 if(CFG.token&&CFG.account){
   setTimeout(connectMetaAPI,800);
 } else {
-  // Show hint
-  setTimeout(()=>{
-    const hint=document.createElement('div');
-    hint.style.cssText='position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(19,24,32,.95);border:1px solid var(--gold2);border-radius:10px;padding:20px 28px;text-align:center;z-index:50;font-size:13px;color:var(--ink2);max-width:280px';
-    hint.innerHTML=`<div style="color:var(--gold);font-weight:700;margin-bottom:8px;font-size:15px">⚙️ إعداد MetaAPI</div>
-      <div style="margin-bottom:12px;line-height:1.7">اضغط على زر الإعدادات أو <b style="color:var(--cyan)">غير متصل</b> في الأعلى لإدخال MetaAPI Token و Account ID</div>
-      <button onclick="this.parentNode.remove();openSettings()" style="background:var(--blue2);border:none;border-radius:6px;padding:8px 20px;color:#fff;font-weight:700;cursor:pointer;font-family:Cairo">إدخال البيانات الآن</button>
-      <div style="margin-top:10px;font-size:10px;color:var(--ink3)">أو استمر بالمشاهدة على بيانات محاكاة</div>`;
-    document.getElementById('chart-wrap').appendChild(hint);
-    setTimeout(()=>hint.remove(),8000);
-  },1500);
+  // Show connection required screen
+  showConnectionScreen();
 }
 </script>
 </body>
