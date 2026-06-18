@@ -1346,24 +1346,10 @@ async function connectMetaAPI(){
   if(!CFG.token||!CFG.account){openSettings();return;}
   setStatus('connecting','جارٍ الاتصال...');
   try {
-    // Load MetaAPI SDK dynamically from CDN
-    if(!window.MetaApi){
-      await new Promise((res,rej)=>{
-        const s=document.createElement('script');
-        s.src='https://cdn.jsdelivr.net/npm/metaapi.cloud-sdk@latest/index.js';
-        s.onload=res;s.onerror=rej;document.head.appendChild(s);
-      });
-    }
-    const api=new window.MetaApi.default(CFG.token);
-    const account=await api.metatraderAccountApi.getAccount(CFG.account);
-    if(!['DEPLOYED','DEPLOYING'].includes(account.state)){
-      await account.deploy();
-    }
-    await account.waitDeployed();
-    const conn=account.getRPCConnection();
-    await conn.connect();
-    await conn.waitSynchronized();
-    S.api=api;S.account=account;S.connection=conn;S.connected=true;
+    // Test connection via REST API
+    const info = await maFetch('/users/current/accounts/'+CFG.account+'/accountInformation');
+    S.connected=true;
+    S.accountInfo=info;
     setStatus('connected','متصل ✓');
 
     // Fetch initial data
@@ -1371,66 +1357,88 @@ async function connectMetaAPI(){
     await fetchCandles();
     computeAll();render();
 
-    // Start live feed
+    // Start polling for live data
     startLiveFeed();
   } catch(err){
     console.error('MetaAPI error:',err);
     setStatus('disconnected','خطأ: '+err.message.substring(0,30));
+    console.error(err);
   }
 }
 
+// ══ MetaAPI REST API Helper ══
+async function maFetch(path, method='GET', body=null){
+  const BASES=[
+    'https://mt-client-api-v1.london.agiliumtrade.ai',
+    'https://mt-client-api-v1.new-york.agiliumtrade.ai',
+  ];
+  for(const BASE of BASES){
+    try{
+      const opts={method,headers:{'auth-token':CFG.token,'Content-Type':'application/json'}};
+      if(body) opts.body=JSON.stringify(body);
+      const res=await fetch(BASE+path,opts);
+      if(res.status===200||res.status===201){return await res.json();}
+      if(res.status===404) continue;
+      const txt=await res.text();
+      throw new Error('HTTP '+res.status+': '+txt.slice(0,80));
+    }catch(e){if(e.message.startsWith('HTTP'))throw e;}
+  }
+  throw new Error('All API endpoints failed');
+}
+
 async function fetchAccountInfo(){
-  if(!S.connection)return;
+  if(!S.connected)return;
   try{
-    const info=await S.connection.getAccountInformation();
+    const info=await maFetch('/users/current/accounts/'+CFG.account+'/accountInformation');
     S.accountInfo=info;
     document.getElementById('s-equity').textContent='$'+(info.equity||0).toFixed(0);
     document.getElementById('s-profit').textContent=(info.profit>=0?'+':'')+(info.profit||0).toFixed(2);
     document.getElementById('s-profit').style.color=info.profit>=0?'var(--green)':'var(--red)';
     document.getElementById('s-margin').textContent='$'+(info.margin||0).toFixed(0);
-  } catch(e){console.warn('fetchAccountInfo:',e);}
+  }catch(e){console.warn('fetchAccountInfo:',e);}
 }
 
 async function fetchCandles(){
-  if(!S.connection)return;
+  if(!S.connected)return;
   try{
-    const tfMap={'1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'4h','1d':'1d'};
-    const raw=await S.connection.getHistoricalCandles(CFG.symbol,tfMap[S.tf]||'15m',
-      new Date(Date.now()-200*15*60*1000),new Date(),200);
+    const tf=document.querySelector('.tf-btn.active')?.dataset.tf||'15m';
+    const startISO=new Date(Date.now()-200*15*60*1000).toISOString();
+    const raw=await maFetch(
+      '/users/current/accounts/'+CFG.account+'/historical-candles/'+CFG.symbol+'/'+tf+'?startTime='+startISO+'&limit=200'
+    );
     if(raw&&raw.length){
       S.candles=raw.map(c=>({
         o:c.open,h:c.high,l:c.low,c:c.close,v:c.tickVolume||1000,
-        t:new Date(c.time).getTime(),bull:c.close>=c.open,
-        range:c.high-c.low,sp:null
+        t:new Date(c.time).getTime(),bull:c.close>=c.open,range:c.high-c.low,sp:null
       }));
     }
-  } catch(e){console.warn('fetchCandles:',e);}
+  }catch(e){console.warn('fetchCandles:',e);}
 }
 
 function startLiveFeed(){
-  if(!S.connection)return;
-  // Subscribe to symbol price
-  S.connection.subscribeTo={};
-  S.connection.addSynchronizationListener({
-    onSymbolPriceUpdated: async(id,price)=>{
-      if(price.symbol!==CFG.symbol)return;
-      S.bid=price.bid;S.ask=price.ask;
-      S.spread=+(price.ask-price.bid).toFixed(2);
-      S.price=price.bid;
-      // Update last candle close
-      if(S.candles.length){
-        const last=S.candles[S.candles.length-1];
-        last.c=price.bid;last.h=Math.max(last.h,price.bid);last.l=Math.min(last.l,price.bid);last.bull=last.c>=last.o;
+  // Poll price & account every 3 seconds via REST
+  const poll=async()=>{
+    if(!S.connected)return;
+    try{
+      const tick=await maFetch('/users/current/accounts/'+CFG.account+'/symbols/'+CFG.symbol+'/current-price?keepSubscriptions=true');
+      if(tick&&(tick.bid||tick.last)){
+        const p=tick.bid||tick.last;
+        S.spread=+((tick.ask||p)-(tick.bid||p)).toFixed(2);
+        S.price=p;
+        if(S.candles.length){
+          const last=S.candles[S.candles.length-1];
+          last.c=p;last.h=Math.max(last.h,p);last.l=Math.min(last.l,p);last.bull=last.c>=last.o;
+        }
+        CACHE.ema20[S.candles.length-1]=p;
+        updateTopStats();
+        document.getElementById('s-spread').textContent=S.spread.toFixed(2);
+        render();
       }
-      CACHE.ema20[S.candles.length-1]=price.bid;
-      updateTopStats();document.getElementById('s-spread').textContent=S.spread.toFixed(2);
-      render();
-    }
-  });
-  try{S.connection.subscribeToMarketData(CFG.symbol);}catch(e){}
-
-  // Periodic account info refresh
-  setInterval(fetchAccountInfo,30000);
+    }catch(e){console.warn('poll:',e);}
+  };
+  setInterval(poll,3000);
+  setInterval(fetchAccountInfo,15000);
+  poll(); // immediate first call
 }
 
 // ══════════════════════════════════════════════════════
@@ -1450,19 +1458,31 @@ async function openTrade(dir,entry,sl,tp2){
     showTradeResult('⚠️ غير متصل بـ MetaAPI. أدخل بياناتك أولاً.','var(--gold)');return;
   }
 
-  // Use signal values if provided
   const useEntry=parseFloat(entry)||S.price;
   const useSL=parseFloat(sl)||(dir==='BUY'?useEntry-slPts:useEntry+slPts);
   const useTP=parseFloat(tp2)||(dir==='BUY'?useEntry+tpPts:useEntry-tpPts);
 
   try{
     showTradeResult('⏳ جارٍ التنفيذ...','var(--gold)');
-    const fn=dir==='BUY'?S.connection.createMarketBuyOrder:S.connection.createMarketSellOrder;
-    const result=await fn.call(S.connection,CFG.symbol,lot,useSL,useTP,{comment:'MM-Bot'});
-    showTradeResult(`✅ صفقة ${dir} مفتوحة — ID: ${result.positionId||'OK'}`,'var(--green)');
-    setTimeout(fetchAccountInfo,2000);
-  } catch(e){
-    showTradeResult('❌ خطأ: '+e.message.substring(0,50),'var(--red)');
+    const body={
+      actionType: dir==='BUY'?'ORDER_TYPE_BUY':'ORDER_TYPE_SELL',
+      symbol: CFG.symbol,
+      volume: lot,
+      stopLoss: +useSL.toFixed(2),
+      takeProfit: +useTP.toFixed(2),
+      comment: 'MM-Bot '+dir,
+    };
+    const result=await maFetch('/users/current/accounts/'+CFG.account+'/trade','POST',body);
+    if(result.orderId||result.positionId){
+      showTradeResult('✅ صفقة '+dir+' مفتوحة — ID:'+(result.positionId||result.orderId),'var(--green)');
+      setTimeout(fetchAccountInfo,2000);
+    }else if(result.numericCode&&result.numericCode!==10009){
+      showTradeResult('❌ خطأ MT5: '+result.message,'var(--red)');
+    }else{
+      showTradeResult('✅ صفقة '+dir+' أُرسلت بنجاح','var(--green)');
+    }
+  }catch(e){
+    showTradeResult('❌ '+e.message.slice(0,50),'var(--red)');
   }
 }
 
